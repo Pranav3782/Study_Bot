@@ -1,0 +1,10 @@
+streamlit
+google-generativeai
+langchain-google-genai
+langchain-community
+faiss-cpu
+duckduckgo-search>=6.1.0
+pdfplumber
+python-dotenv
+requests
+beautifulsoup4
