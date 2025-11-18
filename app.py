@@ -14,13 +14,12 @@ from duckduckgo_search import DDGS
 from datetime import datetime
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# --- 1. SETUP & WARNING FIXES ---
-# These lines strictly block the warnings you saw
+# --- 1. OPTIMIZATIONS & SETUP ---
+# Silence all the annoying warnings to keep the app clean
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 warnings.simplefilter(action='ignore', category=ResourceWarning)
-os.environ['GRPC_VERBOSITY'] = 'ERROR'
-os.environ['GLOG_minloglevel'] = '2'
+logging.getLogger("google_genai").setLevel(logging.ERROR)
 
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
@@ -31,28 +30,7 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 
-# --- 2. MODEL SELECTOR (Fast & Stable) ---
-@st.cache_resource
-def get_fast_model():
-    try:
-        # Priority list
-        priority = [
-            "models/gemini-2.5-flash-lite",
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-flash-001"
-        ]
-        my_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for p in priority:
-            if p in my_models:
-                return p.replace("models/", "")
-        return "gemini-1.5-flash"
-    except:
-        return "gemini-1.5-flash"
-
-if "model_name" not in st.session_state:
-    st.session_state.model_name = get_fast_model()
-
-# --- 3. DATABASE ---
+# --- 2. DATABASE & MEMORY MANAGEMENT ---
 def init_db():
     conn = sqlite3.connect('study_history.db')
     c = conn.cursor()
@@ -72,42 +50,79 @@ def save_to_db(question, answer, source):
 def fetch_history():
     conn = sqlite3.connect('study_history.db')
     c = conn.cursor()
-    c.execute("SELECT question, answer FROM history ORDER BY rowid DESC LIMIT 5")
+    # Get all history for the summary
+    c.execute("SELECT question, answer FROM history")
     data = c.fetchall()
     conn.close()
     return data
 
-# --- 4. WEBSITE READER (New Feature!) ---
+def clear_memory():
+    """Wipes the DB and refreshes the page immediately."""
+    conn = sqlite3.connect('study_history.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM history")
+    conn.commit()
+    conn.close()
+    
+    # Clear session state
+    st.session_state.messages = []
+    st.session_state.gemini_files = []
+    st.rerun() # Instant refresh
+
+# --- 3. FAST MODEL SELECTOR ---
+@st.cache_resource
+def get_fast_model():
+    """Prioritizes the fastest stable models."""
+    try:
+        priority = [
+            "models/gemini-2.5-flash-lite", # Fastest if available
+            "models/gemini-1.5-flash",      # Standard fast
+            "models/gemini-1.5-flash-001"
+        ]
+        my_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for p in priority:
+            if p in my_models:
+                return p.replace("models/", "")
+        return "gemini-1.5-flash"
+    except:
+        return "gemini-1.5-flash"
+
+if "model_name" not in st.session_state:
+    st.session_state.model_name = get_fast_model()
+
+# --- 4. TOOLS (Web & Search) ---
 def extract_urls(text):
-    """Finds all URLs in the user's text."""
     url_pattern = re.compile(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
     return url_pattern.findall(text)
 
 def scrape_website(url):
-    """Visits a website and grabs the text."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(url, headers=headers, timeout=5)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=3) # 3s timeout for speed
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Kill script and style elements
-        for script in soup(["script", "style"]):
+        # Remove junk
+        for script in soup(["script", "style", "nav", "footer"]):
             script.extract()
-            
         text = soup.get_text()
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        clean_text = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        return clean_text[:5000] # Limit to first 5000 chars to save tokens
-    except Exception as e:
-        return f"Error reading website: {e}"
+        clean_text = '\n'.join(line.strip() for line in text.splitlines() if line.strip())
+        return clean_text[:6000] # Limit char count for speed
+    except Exception:
+        return ""
 
-# --- 5. FILE UPLOAD ---
+def google_search_fallback(query):
+    try:
+        # Limit to top 2 results for maximum speed
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=2))
+            if results:
+                return "\n".join([f"{r['body']}" for r in results])
+    except: return ""
+    return ""
+
+# --- 5. FILE UPLOAD (Fast) ---
 def upload_to_gemini(uploaded_files):
     uploaded_content = []
-    st.toast(f"🚀 Processing {len(uploaded_files)} files...", icon="⏳")
+    st.toast(f"🚀 Uploading {len(uploaded_files)} files...", icon="⚡")
     
     for up_file in uploaded_files:
         try:
@@ -117,118 +132,111 @@ def upload_to_gemini(uploaded_files):
             
             gemini_file = genai.upload_file(tmp_path, mime_type="application/pdf")
             
+            # Optimized wait loop
             start = time.time()
             while gemini_file.state.name == "PROCESSING":
-                if time.time() - start > 15: break
+                if time.time() - start > 10: break # Lower timeout
                 time.sleep(0.5)
                 gemini_file = genai.get_file(gemini_file.name)
-                
+            
             if gemini_file.state.name == "ACTIVE":
                 uploaded_content.append(gemini_file)
-            else:
-                st.error(f"Skipped {up_file.name} (Processing failed)")
-        except Exception:
-            st.error(f"Error reading {up_file.name}")
+        except: pass
         finally:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            try: os.remove(tmp_path)
             except: pass
-            
     return uploaded_content
 
-# --- 6. SEARCH FALLBACK ---
-def google_search_fallback(query):
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=2))
-            if results:
-                return "\n".join([f"{r['body']}" for r in results])
-    except: return ""
-    return ""
-
-# --- 7. STREAMING GENERATOR (Friendly & Simple) ---
+# --- 6. THE FRIENDLY BRAIN (Streaming) ---
 def stream_answer(question, context_files=None, google_context=None, website_context=None, mode="Answer"):
     model = genai.GenerativeModel(st.session_state.model_name)
     
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
+    # Allow the AI to answer freely without getting blocked easily
+    safety = {HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE}
 
-    # Build Prompt
     prompt_parts = []
     
     if mode == "Recall":
-        prompt_parts.append(f"Summarize this conversation history simply in bullet points:\n{google_context}")
+        prompt_parts.append(f"""
+        Here is the chat history:
+        {google_context}
+        
+        TASK:
+        You are a helpful Study Assistant. 📝
+        Create a bullet-point summary of all the topics discussed above. 
+        Make it easy to review!
+        """)
     else:
-        # Add Files
+        # Add Contexts
         if context_files:
             prompt_parts.extend(context_files)
-            prompt_parts.append("Context: Use the PDF notes provided above.")
-        
-        # Add Website Content
+            prompt_parts.append("Source: PDF Notes.")
         if website_context:
-            prompt_parts.append(f"Context: Content from the website link provided by user:\n{website_context}")
-            
-        # Add Google Search
+            prompt_parts.append(f"Source: Website Content:\n{website_context}")
         if google_context:
-            prompt_parts.append(f"Context: Internet Search Results:\n{google_context}")
+            prompt_parts.append(f"Source: Google Search:\n{google_context}")
         
-        # --- THE "FRIENDLY & SIMPLE" BRAIN ---
+        # THE PERSONA
         prompt_parts.append(f"""
         User Question: {question}
         
-        Your Persona: You are a super friendly, easy-going Study Buddy. 🤝
+        Your Personality: 
+        You are a friendly, energetic, and super-fast Study Buddy! ⚡😊
         
         Instructions:
-        1. ANSWER SIMPLY: Use plain English. Avoid big jargon.
-        2. KEEP IT SHORT: Aim for 2-3 sentences unless asked to "elaborate" or "explain in detail".
-        3. BE HELPFUL: If the user asks to "elaborate", then give a simple detailed explanation with analogies.
-        4. If using a website link, mention "According to the link...".
+        1. Answer in SIMPLE English.
+        2. Keep it SHORT (2-3 sentences) for speed.
+        3. Only give long answers if the user asks to "elaborate" or "explain in detail".
+        4. Use emojis occasionally to be friendly.
+        5. If using a source, mention it briefly.
         """)
 
     try:
-        response_stream = model.generate_content(prompt_parts, stream=True, safety_settings=safety_settings)
+        # stream=True makes it feel much faster
+        response_stream = model.generate_content(prompt_parts, stream=True, safety_settings=safety)
         for chunk in response_stream:
             try:
-                if chunk.text:
-                    yield chunk.text
-            except ValueError:
-                pass
-    except Exception as e:
-        yield f"⚠️ Oops, network glitch! Try again."
+                if chunk.text: yield chunk.text
+            except ValueError: pass
+    except Exception:
+        yield "⚠️ My brain is buffering... try asking again!"
 
-# --- 8. UI ---
+# --- 7. UI LAYOUT ---
 def main():
-    st.set_page_config(page_title="Study Bot", page_icon="🤖", layout="wide")
+    st.set_page_config(page_title="Study Bot", page_icon="⚡", layout="wide")
     init_db()
     
-    st.title("🤖 Study Buddy")
-    st.caption(f"No worries about study ")
-
+    st.title("⚡Study Buddy")
+    
     if "gemini_files" not in st.session_state:
         st.session_state.gemini_files = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "assistant", "content": "Hi there! 👋 I'm ready. Upload notes, paste a link, or just ask away!"}]
 
+    # --- SIDEBAR ---
     with st.sidebar:
-        st.header("📂 Upload Notes")
-        pdf_docs = st.file_uploader("Drag & Drop PDFs", accept_multiple_files=True, type=['pdf'])
-        if st.button("⚡ Read"):
+        st.header("🧰 Control Panel")
+        
+        st.subheader(" Add Files")
+        pdf_docs = st.file_uploader("Upload PDFs", accept_multiple_files=True, type=['pdf'])
+        if st.button("⚡ Process PDFs"):
             if pdf_docs:
                 st.session_state.gemini_files = upload_to_gemini(pdf_docs)
-                if st.session_state.gemini_files:
-                    st.success(f"Got it! I read {len(pdf_docs)} files.")
+                if st.session_state.gemini_files: st.success(f"Memorized {len(pdf_docs)} files!")
+        
+        st.divider()
+        
+        st.subheader("Settings")
+        # THE CLEAR BUTTON (Red for visibility)
+        if st.button("🗑️ Clear Memory", type="primary"):
+            clear_memory()
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "Hi! 👋 Paste a link, upload a PDF, or just ask me anything. I'll keep it simple!"}]
-
+    # --- CHAT WINDOW ---
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    user_question = st.chat_input("Paste a link or ask a question...")
+    user_question = st.chat_input("Ask me anything...")
 
     if user_question:
         st.chat_message("user").markdown(user_question)
@@ -239,32 +247,35 @@ def main():
         website_info = ""
         mode = "Answer"
         
-        # A. Handle "Recall"
+        # LOGIC: RECALL
         if "recall" in user_question.lower():
             history = fetch_history()
-            google_info = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
+            if not history:
+                google_info = "No history yet."
+            else:
+                google_info = "\n".join([f"Q: {q}\nA: {a}" for q, a in history])
             mode = "Recall"
             source_labels.append("🧠 Memory")
             
+        # LOGIC: ANSWER
         else:
-            # B. Handle URL in Chat (New Feature!)
+            # 1. Check for URL
             urls = extract_urls(user_question)
             if urls:
-                with st.spinner(f"🔗 Reading website: {urls[0]}..."):
+                with st.spinner("🔗 Reading link..."):
                     website_info = scrape_website(urls[0])
-                    if website_info:
-                        source_labels.append("🌐 Website Link")
+                    if website_info: source_labels.append("🌐 Website")
             
-            # C. Handle Google Search (Only if no files and no URL provided)
+            # 2. Google Search (Only if we have no other context)
             if not st.session_state.gemini_files and not website_info:
-                 with st.spinner("🔎 Searching Google..."):
+                 with st.spinner("🔎 Googling..."):
                     google_info = google_search_fallback(user_question)
-                    if google_info: source_labels.append("🔎 Google")
+                    if google_info: source_labels.append("🔎 Internet")
             
             if st.session_state.gemini_files:
-                source_labels.append("📚 PDF Notes")
+                source_labels.append("📚 PDFs")
 
-        source_text = " + ".join(source_labels) if source_labels else "🤖 AI Knowledge"
+        source_text = " + ".join(source_labels) if source_labels else "🤖 AI Brain"
 
         with st.chat_message("assistant"):
             st.caption(f"Source: {source_text}")
